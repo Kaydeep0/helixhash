@@ -82,6 +82,14 @@ To create an immutable timestamp for any fingerprint:
 3. Submit it as calldata in any EVM transaction
 4. The block timestamp is your proof — anyone can verify by recomputing and comparing
 
+## Reference implementation
+
+Eigenstate Research uses HelixHash to watch 197 entities in tokenized settlement infrastructure and commit fingerprints to Base mainnet every 2 hours.
+
+- Research and on-chain proof index: https://kaydeep0.github.io/eigenstate-research/
+- Five-minute demo with live data: https://kaydeep0.github.io/eigenstate-research/demo/
+- 11 verified commits on Base mainnet: https://kaydeep0.github.io/eigenstate-research/onchain/
+
 ## Honest limitations
 
 - `delta_I` is a log-ratio proxy, not exact KL divergence. It approximates entropy reduction but is not identical to it.
