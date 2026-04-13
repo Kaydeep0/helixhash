@@ -88,7 +88,8 @@ Eigenstate Research uses HelixHash to watch 197 entities in tokenized settlement
 
 - Research and on-chain proof index: https://kaydeep0.github.io/eigenstate-research/
 - Five-minute demo with live data: https://kaydeep0.github.io/eigenstate-research/demo/
-- 11 verified commits on Base mainnet: https://kaydeep0.github.io/eigenstate-research/onchain/
+- 12 verified commits on Base mainnet: https://kaydeep0.github.io/eigenstate-research/onchain/
+- Latest commit: https://basescan.org/tx/8bbb3cd5d6e3dfb54a8f7fe957d0ae4e0f3a5ae52ba4e927aefa6808c781c017
 
 ## Honest limitations
 
