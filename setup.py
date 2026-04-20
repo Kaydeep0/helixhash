@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="helixhash",
-    version="0.1.1",
+    version="0.2.0",
     author="Kirandeep Kaur",
     description="The Helix Hash Function — path integral of E = ΔI/A made computable",
     long_description=open("README.md", encoding="utf-8").read(),
