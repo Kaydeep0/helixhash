@@ -1,51 +1,30 @@
 """
 helixhash
 =========
-The Helix Hash Function — path integral of E = ΔI/A made computable.
+A tamper-evident append-only log.
 
-Axiom: E = ΔI / A
-       Kirandeep Kaur, 2026
+HelixHash proves a sequence of bytestrings existed in this order at
+these times and has not been altered. It makes no claim about whether
+the bytestrings are true, meaningful, or correct.
 
 Quick start
 -----------
->>> from helixhash import HelixHash, Crossing
+>>> from helixhash import HelixHash
 >>> h = HelixHash()
->>> h.cross(Crossing(delta_I=2.0, A=1.0, kappa=0.62, C=0.9))
->>> h.cross(Crossing(delta_I=1.5, A=0.8, kappa=0.63, C=0.9))
->>> print(h.summary())
+>>> h.append(b"first event")
+>>> h.append(b"second event")
+>>> h.verify()
+True
+>>> h.head   # SHA-256 of the latest entry
+'...'
 """
 
 from .core import (
     HelixHash,
-    Crossing,
-    CrossingRecord,
-    PHI,
-    INV_PHI,
-    HBAR,
-    KB,
-    LANDAUER_A,
+    Entry,
+    GENESIS_HASH,
 )
 
-from .analysis import (
-    from_csv,
-    from_vault,
-    from_dicts,
-    detect_decay,
-    find_threshold_crossing,
-    G_trajectory,
-    PT_trajectory,
-    regime_changes,
-    top_crossings,
-    report,
-)
-
-__version__ = "0.2.0"
+__version__ = "1.0.0"
 __author__  = "Kirandeep Kaur"
-__all__ = [
-    "HelixHash", "Crossing", "CrossingRecord",
-    "PHI", "INV_PHI", "HBAR", "KB", "LANDAUER_A",
-    "from_csv", "from_vault", "from_dicts",
-    "detect_decay", "find_threshold_crossing",
-    "G_trajectory", "PT_trajectory", "regime_changes",
-    "top_crossings", "report",
-]
+__all__ = ["HelixHash", "Entry", "GENESIS_HASH"]

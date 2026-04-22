@@ -1,325 +1,328 @@
 """
 helixhash.core
 ==============
-The Helix Hash Function — computable implementation of G = ∮E·dl
+A tamper-evident append-only log.
 
-Axiom: E = ΔI / A  (Efficiency = Information gained / Action paid)
-       Kirandeep Kaur, 2026
+HelixHash proves a sequence of bytestrings existed in this order at
+these times and has not been altered. It makes no claim about whether
+the bytestrings are true, meaningful, or correct. Evaluating the
+content is the job of a witness layer — see witnessfield.
 
-Every crossing is a timestamped efficiency measurement.
-Memory compounds as F(N) = F(N-1) + F(N-2).
-The fingerprint is path-sensitive and irreversible.
-PT = κ × E × (I/A) × C  crosses 1/φ at the quantum→classical threshold.
+Hash formula
+------------
+SHA-256(
+    index            (8 bytes, big-endian)
+  | payload_length   (8 bytes, big-endian)
+  | payload          (variable)
+  | timestamp        (8 bytes, big-endian double)
+  | pubkey_length    (2 bytes, big-endian; 0 or 32)
+  | signer_pubkey    (0 or 32 bytes)
+  | prev_hash        (64 ASCII bytes)
+)
 
-References
-----------
-- Observer Memory Conjecture, Kirandeep Kaur (2026)
-- Landauer (1961): minimum action per bit = k_B T ln(2)
-- Tonomura (1986): Aharonov-Bohm effect — path integral is physically real
-- Bekenstein bound: information limit of a physical region
+signer_pubkey is length-prefixed and included in the hash so that
+swapping a pubkey on a signed entry breaks the chain immediately.
 """
 
+from __future__ import annotations
+
 import hashlib
-import math
+import struct
 import time
-from dataclasses import dataclass, field
-from typing import List, Optional
+from base64 import b64decode, b64encode
+from dataclasses import dataclass
+from typing import Any, Optional
 
-# ── Physical constants ────────────────────────────────────────────────────────
-PHI         = (1 + math.sqrt(5)) / 2   # golden ratio
-INV_PHI     = 1 / PHI                  # 1/φ ≈ 0.61803 — the threshold
-HBAR        = 1.0545718e-34            # J·s — Planck's constant / 2π
-KB          = 1.380649e-23             # J/K — Boltzmann constant
-LANDAUER_T  = 300.0                    # K   — room temperature default
-LANDAUER_A  = KB * LANDAUER_T * math.log(2)  # minimum action per bit ≈ 2.87e-21 J
+GENESIS_HASH: str = "0" * 64  # fixed sentinel for the first entry's prev_hash
 
 
-# ── Data structures ───────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Internal: canonical hash computation
+# ---------------------------------------------------------------------------
 
-@dataclass
-class Crossing:
+def _compute_hash(
+    index: int,
+    payload: bytes,
+    timestamp: float,
+    signer_pubkey: Optional[bytes],
+    prev_hash: str,
+) -> str:
     """
-    One irreversible event in the path integral.
+    Compute the canonical SHA-256 hash for an entry.
 
-    Parameters
-    ----------
-    delta_I : float
-        Bits of surprise resolved. ΔI = H(prior) - H(posterior).
-        At minimum: log₂(2/1) = 1 bit for a binary distinction.
-    A : float
-        Action cost paid. In natural units: multiples of k_B T ln(2).
-        At minimum: 1.0 (the Landauer floor, normalised).
-    kappa : float
-        Coherence. bonds / possible ∈ (0, 1].
-        Equilibrium at κ = 1/φ ≈ 0.618.
-    C : float
-        Credibility. e^(-λ·violations) ∈ (0, 1].
-        Perfect credibility = 1.0.
-    timestamp : float
-        Unix timestamp. Defaults to now.
-    label : str
-        Human-readable description of this crossing.
+    All variable-length fields are length-prefixed to prevent extension
+    attacks and ensure the encoding is unambiguous.
     """
-    delta_I  : float
-    A        : float
-    kappa    : float = INV_PHI
-    C        : float = 1.0
-    timestamp: float = field(default_factory=time.time)
-    label    : str   = ""
-
-    def __post_init__(self):
-        if self.delta_I <= 0:
-            raise ValueError(f"delta_I must be > 0, got {self.delta_I}")
-        if self.A <= 0:
-            raise ValueError(f"A must be > 0, got {self.A}")
-        if not (0 < self.kappa <= 1):
-            raise ValueError(f"kappa must be in (0,1], got {self.kappa}")
-        if not (0 < self.C <= 1):
-            raise ValueError(f"C must be in (0,1], got {self.C}")
+    h = hashlib.sha256()
+    h.update(index.to_bytes(8, "big"))
+    h.update(len(payload).to_bytes(8, "big"))
+    h.update(payload)
+    h.update(struct.pack(">d", timestamp))
+    pk = signer_pubkey if signer_pubkey is not None else b""
+    h.update(len(pk).to_bytes(2, "big"))
+    h.update(pk)
+    h.update(prev_hash.encode("ascii"))
+    return h.hexdigest()
 
 
-@dataclass
-class CrossingRecord:
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Entry:
     """
-    The full output record for one crossing — everything the helix hash produces.
+    A single record in the append-only chain.
+
+    All fields are immutable. ``hash`` covers all fields except
+    ``signature`` (which is computed over the hash). ``signer_pubkey``
+    is covered by the hash, so swapping it breaks the chain.
     """
-    n          : int     # crossing index (1-based)
-    crossing   : Crossing
-    E          : float   # efficiency this crossing = ΔI / A
-    G          : float   # accumulated memory (Fibonacci-weighted)
-    PT         : float   # protocol truth = κ × E × (I/A)_cumulative × C
-    regime     : str     # 'quantum' or 'classical'
-    fingerprint: str     # 64-char hex — chained hash of full path
-    psi        : float   # irreversibility potential Ψ (normalised)
-    threshold_crossed: bool  # True if PT ≥ 1/φ for first time at this crossing
 
-    def __repr__(self):
-        return (
-            f"Crossing {self.n:>4} | "
-            f"E={self.E:7.4f} | "
-            f"G={self.G:12.4f} | "
-            f"PT={self.PT:6.4f} | "
-            f"{self.regime:<9} | "
-            f"{self.fingerprint[:16]}…"
-        )
+    index:         int
+    payload:       bytes
+    timestamp:     float           # unix seconds (monotonically increasing)
+    prev_hash:     str             # GENESIS_HASH for index 0
+    hash:          str             # SHA-256 of canonical fields (see module docstring)
+    signature:     Optional[bytes] # Ed25519 signature over hash.encode("ascii"), or None
+    signer_pubkey: Optional[bytes] # raw 32-byte Ed25519 verify key, or None
 
 
-# ── The Helix Hash ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# HelixHash
+# ---------------------------------------------------------------------------
 
 class HelixHash:
     """
-    The Helix Hash accumulates a path integral of E = ΔI/A.
+    Tamper-evident append-only log.
 
-    Each call to .cross() adds one crossing to the path.
-    The path is irreversible: each fingerprint depends on all prior fingerprints.
-    Memory compounds as Fibonacci: G(n) = G(n-1) + G(n-2) + ε·E(n).
+    - ``append`` adds an entry and returns it.
+    - ``verify`` replays the full chain; returns False on any tampering.
+    - ``export`` / ``from_export`` enable JSON round-trips.
+    - ``head`` is the hash of the most recent entry (or GENESIS_HASH if empty).
+    - ``length`` is the number of entries.
 
-    The threshold PT = 1/φ marks the quantum→classical transition.
-    Below it: exploring, probabilistic, potential.
-    At it:    collapse — probability becomes 0 or 1.
-    Above it: committed, irreversible, actual.
-
-    Usage
-    -----
-    >>> h = HelixHash()
-    >>> r = h.cross(Crossing(delta_I=1.0, A=1.0, kappa=0.62, C=0.9))
-    >>> print(r)
+    Signing (optional)
+    ------------------
+    Pass an ``Ed25519PrivateKey`` from the ``cryptography`` library as
+    ``signer``. The public key is embedded in the entry and in the hash.
+    Install with: pip install cryptography
     """
 
-    def __init__(self, fibonacci_weight: float = 0.1, min_crossings_for_threshold: int = 3):
+    def __init__(self) -> None:
+        self._entries: list[Entry] = []
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def append(
+        self,
+        payload: bytes,
+        signer: Optional[Any] = None,  # Ed25519PrivateKey (cryptography lib)
+    ) -> Entry:
         """
-        Parameters
-        ----------
-        fibonacci_weight : float
-            How strongly each new E_n contributes to the Fibonacci accumulation.
-        min_crossings_for_threshold : int
-            Minimum crossings before PT can declare classical regime.
-            Guards against a single high-E crossing flipping the regime immediately.
-            The conjecture requires accumulated path history. Default 3.
+        Append a new entry and return it.
+
+        ``payload`` must be bytes. If ``signer`` is provided it must be
+        an ``Ed25519PrivateKey``; the entry will include a signature and
+        the signer's public key.
+
+        Timestamps are generated internally from ``time.time()``. If the
+        system clock moves backwards, the new timestamp is bumped to
+        ``previous + 1 microsecond`` to preserve strict monotonicity.
         """
-        self._records      : List[CrossingRecord] = []
-        self._prev_hash    : str   = "0" * 64
-        self._G_prev2      : float = 0.0
-        self._G_prev1      : float = 0.0
-        self._sum_dI       : float = 0.0
-        self._sum_A        : float = 0.0
-        self._threshold_hit: bool  = False
-        self.fibonacci_weight = fibonacci_weight
-        self.min_crossings_for_threshold = min_crossings_for_threshold
+        if not isinstance(payload, bytes):
+            raise TypeError("payload must be bytes")
 
-    # ── Public API ────────────────────────────────────────────────────────────
+        now = time.time()
+        if self._entries and now <= self._entries[-1].timestamp:
+            now = self._entries[-1].timestamp + 1e-6
 
-    def cross(self, c: Crossing) -> CrossingRecord:
-        """Add one crossing to the path integral. Returns the full record."""
-        n = len(self._records) + 1
+        prev_hash = self._entries[-1].hash if self._entries else GENESIS_HASH
+        index = len(self._entries)
 
-        # Efficiency this crossing
-        E = c.delta_I / c.A
+        signer_pubkey: Optional[bytes] = None
+        if signer is not None:
+            signer_pubkey = _extract_pubkey(signer)
 
-        # Fibonacci-weighted memory accumulation
-        # G(n) = G(n-1) + G(n-2) + ε·E(n)
-        # At n=1,2 we bootstrap from the seed
-        if n == 1:
-            G = E
-        elif n == 2:
-            G = self._G_prev1 + E
-        else:
-            G = self._G_prev1 + self._G_prev2 + self.fibonacci_weight * E
+        entry_hash = _compute_hash(index, payload, now, signer_pubkey, prev_hash)
 
-        # Cumulative I/A ratio (total information / total action)
-        self._sum_dI += c.delta_I
-        self._sum_A  += c.A
-        cumulative_IA = self._sum_dI / self._sum_A
+        signature: Optional[bytes] = None
+        if signer is not None:
+            signature = _sign(signer, entry_hash.encode("ascii"))
 
-        # Protocol truth — product of all N/D ratios
-        PT = min(c.kappa * E * cumulative_IA * c.C, 1.0)
-
-        # Regime — requires min_crossings_for_threshold before classical can be declared
-        # HONEST LABEL: this guard is a design choice, not derived from the axiom.
-        # It prevents a single isolated high-E event from flipping the regime.
-        # The conjecture states PT is a cumulative product; single events are not paths.
-        was_quantum = not self._threshold_hit
-        enough_history = n >= self.min_crossings_for_threshold
-        newly_crossed = (PT >= INV_PHI) and was_quantum and enough_history
-        if newly_crossed:
-            self._threshold_hit = True
-        regime = "classical" if (PT >= INV_PHI and self._threshold_hit) else "quantum"
-
-        # Irreversibility potential Ψ
-        # HONEST LABEL: ESTIMATED — the full expression requires A_erase from
-        # the actual physical system. Here A_erase grows with G as a proxy:
-        # A_erase = A_write × (1 + G/ref) where ref = max(G, 10).
-        # This captures the correct direction (Ψ grows as memory accumulates)
-        # but the absolute values are not derived from first principles.
-        # Ψ ≥ 0 is guaranteed by construction (second law holds).
-        A_erase = c.A * (1 + G / max(G, 10))
-        psi = c.delta_I * (A_erase - c.A) / (c.A * A_erase) if A_erase > c.A else 0.0
-
-        # Fingerprint — chain hash of full crossing state + previous fingerprint
-        payload = (
-            f"{n}|{c.delta_I:.8f}|{c.A:.8f}|"
-            f"{c.kappa:.8f}|{c.C:.8f}|"
-            f"{c.timestamp:.6f}|{self._prev_hash}"
-        ).encode()
-        fingerprint = hashlib.sha256(payload).hexdigest()
-
-        # Build record
-        record = CrossingRecord(
-            n=n,
-            crossing=c,
-            E=E,
-            G=G,
-            PT=PT,
-            regime=regime,
-            fingerprint=fingerprint,
-            psi=psi,
-            threshold_crossed=newly_crossed,
+        entry = Entry(
+            index=index,
+            payload=payload,
+            timestamp=now,
+            prev_hash=prev_hash,
+            hash=entry_hash,
+            signature=signature,
+            signer_pubkey=signer_pubkey,
         )
-
-        # Advance state
-        self._records.append(record)
-        self._prev_hash = fingerprint
-        self._G_prev2   = self._G_prev1
-        self._G_prev1   = G
-
-        return record
-
-    def cross_many(self, crossings: List[Crossing]) -> List[CrossingRecord]:
-        """Feed a list of crossings at once. Returns all records."""
-        return [self.cross(c) for c in crossings]
-
-    # ── Introspection ─────────────────────────────────────────────────────────
-
-    @property
-    def records(self) -> List[CrossingRecord]:
-        return list(self._records)
-
-    @property
-    def G(self) -> float:
-        """Current accumulated memory G = ∮E·dl"""
-        return self._records[-1].G if self._records else 0.0
-
-    @property
-    def PT(self) -> float:
-        """Current protocol truth value"""
-        return self._records[-1].PT if self._records else 0.0
-
-    @property
-    def regime(self) -> str:
-        """Current regime: 'quantum' or 'classical'"""
-        return self._records[-1].regime if self._records else "quantum"
-
-    @property
-    def fingerprint(self) -> str:
-        """Current fingerprint — encodes the entire path"""
-        return self._prev_hash
-
-    @property
-    def N(self) -> int:
-        """Number of crossings so far"""
-        return len(self._records)
-
-    @property
-    def E_memory(self) -> float:
-        """
-        E_memory = Σ(ΔI where E≥1) / Σ(ΔI where E<1)
-
-        HONEST LABEL: PROXY — this uses E≥1 as a proxy for "giving" and E<1
-        for "taking". In the vault system, E≥1 crossings correspond to outward
-        information flow (giving rows) and E<1 to extraction (taking rows).
-        If your data has an explicit source column, use from_vault() which maps
-        the type column directly. Raw crossings without labels use this proxy.
-
-        System is healthy when E_memory > 1 (giving outpaces taking).
-        System is decaying when E_memory < 1 (extraction dominates).
-        Conjecture value for the live system: E_memory = 9/92 ≈ 0.098.
-        """
-        if not self._records:
-            return 0.0
-        giving = sum(r.crossing.delta_I for r in self._records if r.E >= 1.0)
-        taking = sum(r.crossing.delta_I for r in self._records if r.E < 1.0)
-        return giving / taking if taking > 0 else float('inf')
-
-    def summary(self) -> dict:
-        """Return a summary dict of the current helix state."""
-        if not self._records:
-            return {"N": 0, "G": 0.0, "PT": 0.0, "regime": "quantum",
-                    "E_memory": 0.0, "threshold_crossed": False,
-                    "fingerprint": self._prev_hash}
-        return {
-            "N"                : self.N,
-            "G"                : round(self.G, 6),
-            "PT"               : round(self.PT, 6),
-            "regime"           : self.regime,
-            "E_memory"         : round(self.E_memory, 6),
-            "threshold_crossed": self._threshold_hit,
-            "fingerprint"      : self.fingerprint,
-            "INV_PHI"          : round(INV_PHI, 6),
-            "distance_to_threshold": round(INV_PHI - self.PT, 6),
-        }
+        self._entries.append(entry)
+        return entry
 
     def verify(self) -> bool:
         """
-        Verify the integrity of the entire chain.
-        Re-derives every fingerprint from scratch and checks it matches.
-        Returns True if the chain is intact, False if any crossing was tampered with.
+        Replay the full chain and return True if it is intact.
+
+        Checks, in order, for each entry:
+        1. index == position in list
+        2. prev_hash == previous entry's hash (or GENESIS_HASH for first)
+        3. hash == recomputed canonical hash (catches payload/timestamp tampering)
+        4. if signature is present: signature verifies against signer_pubkey
         """
-        prev = "0" * 64
-        for r in self._records:
-            c = r.crossing
-            payload = (
-                f"{r.n}|{c.delta_I:.8f}|{c.A:.8f}|"
-                f"{c.kappa:.8f}|{c.C:.8f}|"
-                f"{c.timestamp:.6f}|{prev}"
-            ).encode()
-            expected = hashlib.sha256(payload).hexdigest()
-            if expected != r.fingerprint:
+        prev_hash = GENESIS_HASH
+        for i, entry in enumerate(self._entries):
+            if entry.index != i:
                 return False
-            prev = r.fingerprint
+            if entry.prev_hash != prev_hash:
+                return False
+            expected = _compute_hash(
+                entry.index,
+                entry.payload,
+                entry.timestamp,
+                entry.signer_pubkey,
+                entry.prev_hash,
+            )
+            if entry.hash != expected:
+                return False
+            if entry.signature is not None:
+                if not _verify_sig(entry.signer_pubkey, entry.signature,
+                                   entry.hash.encode("ascii")):
+                    return False
+            prev_hash = entry.hash
         return True
 
-    def __repr__(self):
-        return (
-            f"HelixHash(N={self.N}, G={self.G:.4f}, "
-            f"PT={self.PT:.4f}, regime='{self.regime}')"
+    def export(self) -> list[dict]:
+        """
+        Return a JSON-serialisable list of all entries.
+
+        ``payload``, ``signature``, and ``signer_pubkey`` are base64-encoded.
+        """
+        out = []
+        for e in self._entries:
+            out.append({
+                "index":         e.index,
+                "payload":       b64encode(e.payload).decode("ascii"),
+                "timestamp":     e.timestamp,
+                "prev_hash":     e.prev_hash,
+                "hash":          e.hash,
+                "signature":     b64encode(e.signature).decode("ascii") if e.signature else None,
+                "signer_pubkey": b64encode(e.signer_pubkey).decode("ascii") if e.signer_pubkey else None,
+            })
+        return out
+
+    @classmethod
+    def from_export(cls, entries: list[dict]) -> "HelixHash":
+        """
+        Reconstruct a HelixHash from a previously exported list.
+
+        Validates structural integrity before loading:
+        - Indices must be 0, 1, 2, ... in order.
+        - Timestamps must be monotonically non-decreasing.
+        - Each ``prev_hash`` must match the previous entry's ``hash``.
+
+        Raises ``ValueError`` on any structural violation. Call
+        ``verify()`` on the result to additionally confirm hash integrity.
+        """
+        h = cls()
+        prev_hash = GENESIS_HASH
+        prev_ts: Optional[float] = None
+
+        for raw in entries:
+            idx = raw["index"]
+            if idx != len(h._entries):
+                raise ValueError(
+                    f"Entry index {idx} out of order; expected {len(h._entries)}"
+                )
+
+            ts = float(raw["timestamp"])
+            if prev_ts is not None and ts < prev_ts:
+                raise ValueError(
+                    f"Timestamp {ts} at index {idx} is before previous "
+                    f"timestamp {prev_ts}"
+                )
+
+            if raw["prev_hash"] != prev_hash:
+                raise ValueError(
+                    f"prev_hash mismatch at index {idx}: "
+                    f"stored={raw['prev_hash']!r}, expected={prev_hash!r}"
+                )
+
+            entry = Entry(
+                index=idx,
+                payload=b64decode(raw["payload"]),
+                timestamp=ts,
+                prev_hash=raw["prev_hash"],
+                hash=raw["hash"],
+                signature=b64decode(raw["signature"]) if raw.get("signature") else None,
+                signer_pubkey=b64decode(raw["signer_pubkey"]) if raw.get("signer_pubkey") else None,
+            )
+            h._entries.append(entry)
+            prev_hash = entry.hash
+            prev_ts = ts
+
+        return h
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def head(self) -> str:
+        """Hash of the most recent entry, or GENESIS_HASH if the log is empty."""
+        return self._entries[-1].hash if self._entries else GENESIS_HASH
+
+    @property
+    def length(self) -> int:
+        """Number of entries in the log."""
+        return len(self._entries)
+
+
+# ---------------------------------------------------------------------------
+# Signing helpers (lazy import of cryptography)
+# ---------------------------------------------------------------------------
+
+def _extract_pubkey(signer: Any) -> bytes:
+    try:
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        return signer.public_key().public_bytes(
+            encoding=Encoding.Raw,
+            format=PublicFormat.Raw,
         )
+    except ImportError as exc:
+        raise ImportError(
+            "Install 'cryptography' to use signing: pip install cryptography"
+        ) from exc
+    except Exception as exc:
+        raise TypeError(
+            f"signer must be an Ed25519PrivateKey from the cryptography library: {exc}"
+        ) from exc
+
+
+def _sign(signer: Any, data: bytes) -> bytes:
+    try:
+        return signer.sign(data)
+    except Exception as exc:
+        raise TypeError(f"Failed to sign entry: {exc}") from exc
+
+
+def _verify_sig(
+    pubkey_bytes: Optional[bytes],
+    signature: bytes,
+    data: bytes,
+) -> bool:
+    if pubkey_bytes is None:
+        return False
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        pk = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
+        pk.verify(signature, data)
+        return True
+    except ImportError:
+        return False
+    except Exception:
+        return False

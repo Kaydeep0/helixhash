@@ -1,107 +1,178 @@
 # helixhash
 
-A hash-chained observation log with Fibonacci memory accumulation and a protocol truth score.
+A tamper-evident append-only log. Proves a sequence of bytestrings existed in this order at these times and has not been altered.
+
+v1.0 is a clean rewrite. In v0.x, scoring and priors were baked
+into the protocol, which created circular dependencies between the
+two libraries (HelixHash was a high-trust witness class inside
+witnessfield, and witnessfield-style credibility values leaked into
+HelixHash entries). v1.0 separates the protocol (what the library
+guarantees) from policy (opinions about how to weight things).
+HelixHash now only guarantees order and non-tampering. witnessfield
+now only describes witness structure. Scoring is a separate,
+swappable policy layer.
 
 ## Install
 
 ```bash
 pip install helixhash
+
+# Optional: Ed25519 signing support
+pip install helixhash cryptography
 ```
+
+## What it guarantees
+
+**HelixHash proves a sequence of bytestrings existed in this order at
+these times and has not been altered. It makes no claim about whether
+the bytestrings are true, meaningful, or correct. Evaluating the
+content is the job of a witness layer — see witnessfield.**
 
 ## Quickstart
 
 ```python
-from helixhash import HelixHash, Crossing
+from helixhash import HelixHash
 
 h = HelixHash()
+h.append(b"first event")
+h.append(b"second event")
+h.append(b"third event")
 
-h.cross(Crossing(
-    delta_I=2.0,   # log-ratio surprise in bits: log2(observed / expected)
-    A=1.0,         # observation cost (API calls, processing steps, time elapsed)
-    kappa=0.62,    # system coherence (0 to 1)
-    C=0.9,         # credibility (0 to 1)
-    label="SOFR rate change"
-))
-
-h.cross(Crossing(
-    delta_I=0.5,
-    A=1.0,
-    kappa=0.63,
-    C=0.9,
-    label="BUIDL TVL movement"
-))
-
-print(h.verify())     # True — chain is intact
-print(h.fingerprint)  # 64-char SHA-256
-print(h.PT)           # protocol truth score (0 to 1)
-print(h.G)            # accumulated mass
+print(h.length)   # 3
+print(h.head)     # SHA-256 of the last entry (64-char hex)
+print(h.verify()) # True — chain is intact
 ```
 
-## Three properties
+## Hash formula
 
-**1. Fingerprint chain**
-
-Each crossing produces:
-
-```
-SHA256(n | delta_I | A | kappa | C | timestamp | prev_fingerprint)
-```
-
-The previous fingerprint is embedded in every new one. Altering any historical record breaks every subsequent fingerprint at that exact point. `h.verify()` checks the full chain in O(n).
-
-**2. Fibonacci memory**
+Each entry's hash commits to: its index, its payload, its timestamp,
+its signer's public key (if signed), and the previous entry's hash.
 
 ```
-G(1) = E(1)
-G(2) = G(1) + E(2)
-G(n) = G(n-1) + G(n-2) + epsilon * E(n)
+SHA-256(
+    index            (8 bytes, big-endian)
+  | payload_length   (8 bytes, big-endian)
+  | payload          (variable)
+  | timestamp        (8 bytes, big-endian double)
+  | pubkey_length    (2 bytes, big-endian; 0 if unsigned)
+  | signer_pubkey    (0 or 32 bytes)
+  | prev_hash        (64 ASCII bytes)
+)
 ```
 
-Older high-efficiency observations retain persistent weight through Fibonacci recurrence. This is a design choice: the unique solution to the unit-coefficient two-state recurrence. Not proven optimal.
+`signer_pubkey` is in the hash so that swapping an entry's public key
+breaks the chain immediately. `verify()` catches it.
 
-**3. Protocol truth score**
+## Tamper detection
 
+`verify()` replays the full chain in O(n). It catches:
+
+- Any change to a payload
+- Any change to a timestamp
+- Any change to a signer pubkey
+- Any reordering of entries
+- Any inserted or deleted entry
+
+```python
+# Mutate a payload — verify() returns False
+h._entries[1] = Entry(
+    index=1, payload=b"tampered", timestamp=h._entries[1].timestamp,
+    prev_hash=h._entries[1].prev_hash, hash=h._entries[1].hash,
+    signature=None, signer_pubkey=None,
+)
+print(h.verify())  # False
 ```
-PT = kappa * E_current * (sum_dI / sum_A) * C
+
+## Optional signing
+
+Pass an `Ed25519PrivateKey` from the `cryptography` library to sign entries.
+The signature covers the entry hash. The signer's public key is stored in
+the entry and included in the hash.
+
+```python
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+key = Ed25519PrivateKey.generate()
+
+h = HelixHash()
+h.append(b"signed payload", signer=key)
+print(h.verify())  # True — signature checks out
+
+# Forge the signer key: replace pubkey in export
+exported = h.export()
+from base64 import b64encode
+other_key = Ed25519PrivateKey.generate()
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+exported[0]["signer_pubkey"] = b64encode(
+    other_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+).decode()
+h2 = HelixHash.from_export(exported)
+print(h2.verify())  # False — pubkey swap breaks the hash
 ```
 
-| PT | Regime |
-|----|--------|
-| PT < 0.618 | quantum (accumulating) |
-| PT = 0.618 | golden ratio threshold |
-| PT > 0.618 | classical (committed) |
+## Export and import
 
-The threshold is 1/φ ≈ 0.618 — the fixed point of the Fibonacci recurrence in continuous form.
+```python
+import json
 
-## Committing on-chain
+# Export to JSON-serialisable list
+data = h.export()
+json_str = json.dumps(data)
 
-To create an immutable timestamp for any fingerprint:
+# Reconstruct from export
+h2 = HelixHash.from_export(json.loads(json_str))
+print(h2.head == h.head)   # True
+print(h2.verify())         # True
+```
 
-1. Run your observation sequence
-2. Read `h.fingerprint` (64-char hex string)
-3. Submit it as calldata in any EVM transaction
-4. The block timestamp is your proof — anyone can verify by recomputing and comparing
+`from_export` validates structural integrity (index order, timestamp
+monotonicity, prev_hash chain) before loading. Call `verify()` to
+additionally confirm hash integrity.
 
-## Reference implementation
+## API reference
 
-Eigenstate Research uses HelixHash to watch 197 entities in tokenized settlement infrastructure and commit fingerprints to Base mainnet every 2 hours.
+```python
+class HelixHash:
+    def append(self, payload: bytes, signer=None) -> Entry
+    def verify(self) -> bool
+    def export(self) -> list[dict]
 
-- Research and on-chain proof index: https://kaydeep0.github.io/eigenstate-research/
-- Five-minute demo with live data: https://kaydeep0.github.io/eigenstate-research/demo/
-- 11 verified commits on Base mainnet: https://kaydeep0.github.io/eigenstate-research/onchain/
-- Latest commit: https://basescan.org/tx/8bbb3cd5d6e3dfb54a8f7fe957d0ae4e0f3a5ae52ba4e927aefa6808c781c017
+    @classmethod
+    def from_export(cls, entries: list[dict]) -> "HelixHash"
 
-## Honest limitations
+    @property
+    def head(self) -> str     # tip hash, or GENESIS_HASH if empty
+    @property
+    def length(self) -> int
 
-- `delta_I` is a log-ratio proxy, not exact KL divergence. It approximates entropy reduction but is not identical to it.
-- Fibonacci accumulation is a design choice, not a proven optimum.
-- The PT threshold at the golden ratio is derived from the Fibonacci fixed point, not from empirical calibration.
+@dataclass(frozen=True)
+class Entry:
+    index:         int
+    payload:       bytes
+    timestamp:     float          # unix seconds, monotonically increasing
+    prev_hash:     str
+    hash:          str
+    signature:     Optional[bytes]
+    signer_pubkey: Optional[bytes]
+
+GENESIS_HASH: str = "0" * 64    # sentinel for first entry's prev_hash
+```
 
 ## Tests
 
 ```bash
-python tests/test_core.py
+pytest tests/test_helixhash.py -v
 ```
+
+## Honest limitations
+
+- `time.time()` is used for timestamps. If two appends happen within 1 microsecond,
+  the second timestamp is bumped to `previous + 1µs`. Sub-microsecond ordering
+  is not guaranteed.
+- Signing requires the `cryptography` package. Without it, `signer=None` works
+  but signed entries cannot be verified.
+- `from_export` does not recompute hashes on load; call `verify()` to do the
+  full integrity check.
 
 ## License
 
